@@ -10,35 +10,36 @@
       return;
     }
 
-    // Only proceed with setup if accordions are found
+    // Modern browsers (Chrome 131+, Safari 17.6+) wrap <details> content in a
+    // ::details-content pseudo with content-visibility:hidden when [open] is
+    // removed — inline styles on the child can't override it. This rule keeps
+    // the pseudo visible while we animate a sibling closed.
+    const style = document.createElement("style");
+    style.textContent = "details[data-accordion-animating]::details-content{content-visibility:visible!important;display:block!important;}";
+    document.head.appendChild(style);
+
+    // Reduced motion preference
     let prefersReducedMotion = false;
     let reducedMotionQuery = null;
 
-    // Only create media query listener if accordions exist
     try {
-      reducedMotionQuery = window.matchMedia(
-        "(prefers-reduced-motion: reduce)"
-      );
+      reducedMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
       prefersReducedMotion = reducedMotionQuery.matches;
 
-      // Listen for changes to reduced motion preference
       reducedMotionQuery.addEventListener("change", (e) => {
         prefersReducedMotion = e.matches;
       });
     } catch (e) {
-      // Fallback if matchMedia is not supported
       prefersReducedMotion = false;
     }
 
-    // Handle open attribute based on data-accordion-start-open value on page load (only if they exist)
+    // Handle open attribute based on data-accordion-start-open value
     document.querySelectorAll("details[open]").forEach((details) => {
       const startOpen = details.getAttribute("data-accordion-start-open");
 
       if (startOpen === "true") {
-        // Don't alter the open attribute - leave it as is so accordion stays open
         return;
       } else {
-        // For data-accordion-start-open="false", missing attribute, or any other value, remove the open attribute
         details.removeAttribute("open");
       }
     });
@@ -48,19 +49,16 @@
       const summary = details.querySelector("summary");
       const content = details.querySelector("[data-accordion='content']");
 
-      // Skip this accordion if required elements are missing
       if (!summary || !content) {
         return;
       }
 
-      // Set initial collapsed state (check if GSAP is available)
-      // Skip setting collapsed state if data-accordion-start-open="true"
+      // Set initial collapsed state
       const startOpen = details.getAttribute("data-accordion-start-open");
       if (startOpen !== "true") {
         if (typeof gsap !== "undefined") {
           gsap.set(content, { height: 0, overflow: "clip" });
         } else {
-          // Fallback if GSAP is not available
           content.style.height = "0px";
           content.style.overflow = "clip";
         }
@@ -70,11 +68,9 @@
         const isClosing = details.hasAttribute("open");
 
         if (isClosing) {
-          // Prevent native close
           event.preventDefault();
 
           if (prefersReducedMotion) {
-            // Instant close for reduced motion
             details.removeAttribute("open");
           } else {
             // Animate closing
@@ -82,6 +78,7 @@
             content.offsetHeight; // force reflow
 
             if (typeof gsap !== "undefined") {
+              gsap.killTweensOf(content);
               gsap.to(content, {
                 height: 0,
                 duration: 0.4,
@@ -91,7 +88,6 @@
                 },
               });
             } else {
-              // Fallback animation without GSAP
               content.style.transition = "height 0.4s ease-in-out";
               content.style.height = "0px";
               setTimeout(() => {
@@ -100,19 +96,72 @@
               }, 400);
             }
           }
+        } else {
+          // When this <details> is part of an exclusive name="..." group, the
+          // browser will instantly close any open sibling in the same tick.
+          // Animate the sibling closed ourselves before that happens.
+          const groupName = details.getAttribute("name");
+          if (groupName && !prefersReducedMotion) {
+            const siblings = document.querySelectorAll(`details[name="${groupName}"][open]`);
+
+            siblings.forEach((sib) => {
+              if (sib === details) return;
+              const sibContent = sib.querySelector("[data-accordion='content']");
+              if (!sibContent) return;
+
+              if (typeof gsap !== "undefined") {
+                gsap.killTweensOf(sibContent);
+              }
+
+              sibContent.style.height = `${sibContent.scrollHeight}px`;
+              sibContent.style.overflow = "clip";
+              sibContent.style.display = "block";
+
+              // Activates the injected ::details-content CSS rule above.
+              sib.dataset.accordionAnimating = "closing";
+
+              // Force a reflow then start the tween SYNCHRONOUSLY. Between this
+              // handler returning and the next frame, the browser will remove
+              // [open] from the sibling — by the time rAF fires the content's
+              // natural size has already resolved to 0 and the tween would be
+              // invisible.
+              void sibContent.offsetHeight;
+
+              if (typeof gsap !== "undefined") {
+                gsap.to(sibContent, {
+                  height: 0,
+                  duration: 0.4,
+                  ease: "power3.inOut",
+                  onComplete: () => {
+                    delete sib.dataset.accordionAnimating;
+                    sibContent.style.height = "0px";
+                    sibContent.style.display = "";
+                  },
+                });
+              } else {
+                sibContent.style.transition = "height 0.4s ease-in-out";
+                sibContent.style.height = "0px";
+                setTimeout(() => {
+                  delete sib.dataset.accordionAnimating;
+                  sibContent.style.transition = "";
+                  sibContent.style.display = "";
+                }, 400);
+              }
+            });
+          }
         }
       });
 
+      // Animate opening on toggle
       details.addEventListener("toggle", () => {
         if (details.open) {
           const fullHeight = content.scrollHeight;
 
           if (prefersReducedMotion) {
-            // Instant open for reduced motion
             content.style.height = "auto";
           } else {
-            // Animate opening
             if (typeof gsap !== "undefined") {
+              gsap.killTweensOf(content);
               gsap.to(content, {
                 height: fullHeight,
                 duration: 0.4,
@@ -122,7 +171,6 @@
                 },
               });
             } else {
-              // Fallback animation without GSAP
               content.style.transition = "height 0.4s ease-out";
               content.style.height = `${fullHeight}px`;
               setTimeout(() => {
@@ -136,11 +184,10 @@
     });
   }
 
-  // Initialize when DOM is ready
+  // Initialize on DOM ready
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", initializeAccordions);
   } else {
-    // DOM is already ready
     initializeAccordions();
   }
 })();
