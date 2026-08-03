@@ -227,10 +227,18 @@
     }
 
     // Configure fade effect if specified
-    if (element.dataset.effect === "fade") {
-      config.effect = "fade";
-      config.fadeEffect = { crossFade: true };
-    }
+  if (element.dataset.effect === "fade") {
+    config.effect = "fade";
+    config.fadeEffect = { crossFade: true };
+  } else if (element.dataset.effect === "cards") {
+    config.effect = "cards";
+    config.cardsEffect = {
+      slideShadows: true,
+      rotate: true,
+      perSlideRotate: 2,
+      perSlideOffset: 8,
+  };
+}
 
     // Configure speed if specified
     const speed = element.dataset.speed;
