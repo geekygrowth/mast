@@ -65,6 +65,8 @@
  *   data-video-player-label-pause      aria-label, default "Pause"
  *   data-video-player-label-mute       aria-label, default "Mute"
  *   data-video-player-label-unmute     aria-label, default "Unmute"
+ *   data-video-player-label-fullscreen        default "Fullscreen"
+ *   data-video-player-label-exit-fullscreen   default "Exit fullscreen"
  *
  * ---------------------------------------------------------------------------
  * STATE — classes on the component root (prefix configurable)
@@ -78,6 +80,9 @@
  *   cc-loading     stalled, waiting for data
  *   cc-scrubbing   the user is dragging the progress track
  *   cc-fullscreen  in fullscreen
+ *   cc-no-fullscreen  this browser offers no fullscreen route — hide the
+ *                     button with .cc-no-fullscreen [data-video-player=
+ *                     "fullscreen"]{display:none}
  *   cc-disabled    switched off (desktop-only below the breakpoint)
  *
  * `data-video-player-state` carries the primary state as one word:
@@ -262,6 +267,7 @@
       this.timeLabels = this.parts("time");
       this.muteButtons = this.parts("mute");
       this.toggleButtons = this.parts("toggle");
+      this.fullscreenButtons = this.parts("fullscreen");
     }
 
     /**
@@ -561,19 +567,65 @@
       });
     }
 
-    /** Fullscreen toggle, plus the state class for however it was entered. */
+    /**
+     * Fullscreen toggle, plus the state class for however fullscreen was
+     * entered or left — our button, the Esc key, or the browser's own chrome.
+     */
     bindFullscreen() {
-      this.parts("fullscreen").forEach((el) => {
-        this.prepareButton(el, "Fullscreen");
+      this.fullscreenButtons.forEach((el) => {
+        this.prepareButton(el, this.option("label-fullscreen") || "Fullscreen");
         this.on(el, "click", (event) => {
           event.preventDefault();
           this.toggleFullscreen();
         });
       });
 
-      this.on(document, "fullscreenchange", () => {
-        this.setState("fullscreen", document.fullscreenElement === this.root);
-      });
+      // No route at all — an old browser, or an iframe without
+      // allowfullscreen. Publish it so the button can be hidden in CSS
+      // rather than sitting there doing nothing.
+      if (!this.canFullscreen()) this.setState("no-fullscreen", true);
+
+      const sync = () => {
+        this.setState("fullscreen", this.isFullscreen());
+        this.syncState();
+      };
+
+      // Safari below 16.4 only fires the prefixed event.
+      this.on(document, "fullscreenchange", sync);
+      this.on(document, "webkitfullscreenchange", sync);
+
+      // iPhone has no element fullscreen. The video goes fullscreen on its
+      // own and reports it through these two events instead.
+      this.on(this.video, "webkitbeginfullscreen", sync);
+      this.on(this.video, "webkitendfullscreen", sync);
+    }
+
+    /**
+     * Whether any fullscreen route exists in this browser.
+     * @returns {boolean}
+     */
+    canFullscreen() {
+      return !!(
+        this.root.requestFullscreen ||
+        this.root.webkitRequestFullscreen ||
+        this.video.webkitEnterFullscreen ||
+        this.video.webkitSupportsFullscreen
+      );
+    }
+
+    /**
+     * Whether this player is what is currently fullscreen.
+     *
+     * Checks the video as well as the wrapper, because the iPhone route
+     * fullscreens the video element rather than the component.
+     *
+     * @returns {boolean}
+     */
+    isFullscreen() {
+      const current =
+        document.fullscreenElement || document.webkitFullscreenElement || null;
+      if (current) return current === this.root || current === this.video;
+      return !!this.video.webkitDisplayingFullscreen;
     }
 
     /**
@@ -804,18 +856,34 @@
       this.video.muted = !this.video.muted;
     }
 
-    /** Enter or leave fullscreen, with the iOS-only fallback. */
+    /**
+     * Enter or leave fullscreen. Three routes, in order of preference:
+     *
+     *   1. Element Fullscreen on the WRAPPER — desktop, Android, iPad. The
+     *      whole component goes fullscreen, so our control bar goes with it.
+     *   2. The webkit-prefixed version of the same — Safari below 16.4.
+     *   3. video.webkitEnterFullscreen() — iPhone, which has no element
+     *      fullscreen at all. This hands playback to Apple's own player,
+     *      with Apple's controls. Nothing can be done about that.
+     */
     toggleFullscreen() {
-      if (document.fullscreenElement === this.root) {
-        if (document.exitFullscreen) document.exitFullscreen();
+      if (this.isFullscreen()) {
+        const exit = document.exitFullscreen || document.webkitExitFullscreen;
+        if (exit) exit.call(document);
+        else if (this.video.webkitExitFullscreen) {
+          this.video.webkitExitFullscreen();
+        }
         return;
       }
 
-      if (this.root.requestFullscreen) {
-        const promise = this.root.requestFullscreen();
-        if (promise && promise.catch) promise.catch(() => {});
+      const request =
+        this.root.requestFullscreen || this.root.webkitRequestFullscreen;
+
+      if (request) {
+        // May reject when called outside a user gesture — that is fine.
+        const result = request.call(this.root);
+        if (result && result.catch) result.catch(() => {});
       } else if (this.video.webkitEnterFullscreen) {
-        // iPhone Safari will only ever fullscreen the <video> itself.
         this.video.webkitEnterFullscreen();
       }
     }
@@ -876,6 +944,18 @@
       this.toggleButtons.forEach((el) => {
         el.setAttribute("aria-pressed", playing ? "true" : "false");
         if (!el.textContent.trim()) el.setAttribute("aria-label", toggleLabel);
+      });
+
+      // No aria-pressed here: a screen reader already announces the change
+      // through the label, and saying it twice is worse than saying it once.
+      const fullscreenLabel = this.isFullscreen()
+        ? this.option("label-exit-fullscreen") || "Exit fullscreen"
+        : this.option("label-fullscreen") || "Fullscreen";
+
+      this.fullscreenButtons.forEach((el) => {
+        if (!el.textContent.trim()) {
+          el.setAttribute("aria-label", fullscreenLabel);
+        }
       });
     }
 
@@ -1037,6 +1117,7 @@
     "loading",
     "scrubbing",
     "fullscreen",
+    "no-fullscreen",
     "disabled",
   ];
 
