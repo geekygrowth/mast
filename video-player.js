@@ -34,7 +34,8 @@
  *   back             seeks backwards by `skip` seconds.
  *   forward          seeks forwards by `skip` seconds.
  *   mute             mute/unmute toggle.
- *   fullscreen       fullscreen toggle.
+ *   fullscreen       fullscreen toggle. Fullscreen shows the BROWSER'S
+ *                    native controls, not ours — see toggleFullscreen().
  *   progress         the scrub track. Click, drag and keyboard seeking.
  *   progress-fill    grows to the played position (width is set inline).
  *   progress-buffer  grows to the buffered position (width is set inline).
@@ -102,6 +103,14 @@
  *   .video-player_wrap.cc-playing .video-player_chip   { opacity: 0; }
  *   .video-player_wrap.cc-playing .video-player_icon-play  { display: none; }
  *   .video-player_wrap:not(.cc-playing) .video-player_icon-pause { display: none; }
+ *
+ * Fullscreen needs two more, because the video — not the wrapper — is what
+ * goes fullscreen, and an object-fit:cover video will CROP on a screen of a
+ * different shape. The prefixed selector must be its own rule; combining
+ * the two in one comma list invalidates the whole thing in both engines:
+ *
+ *   .video-player_media:fullscreen          { object-fit: contain; }
+ *   .video-player_media:-webkit-full-screen { object-fit: contain; }
  *
  * ---------------------------------------------------------------------------
  * API
@@ -292,8 +301,15 @@
       const preload = this.option("preload");
       if (preload) video.preload = preload;
 
-      // A custom bar is pointless next to the browser's own.
-      video.removeAttribute("controls");
+      // Inline, our own bar does the work. The native bar comes back only
+      // in fullscreen — see applyFullscreenControls().
+      video.controls = false;
+
+      // Hardcoded: no download item, no picture-in-picture. Chromium
+      // honours both, other engines ignore them, and that is fine.
+      video.setAttribute("controlsList", "nodownload");
+      video.setAttribute("disablepictureinpicture", "");
+      video.disablePictureInPicture = true;
 
       this.wantsAutoplay = wantsAutoplay && !prefersReducedMotion;
     }
@@ -389,7 +405,12 @@
       });
 
       if (this.boolOption("click-to-toggle", true)) {
-        this.on(this.video, "click", () => this.toggle());
+        this.on(this.video, "click", () => {
+          // In fullscreen the native controls own the click. Handling it
+          // here as well would toggle twice and cancel itself out.
+          if (this.isFullscreen()) return;
+          this.toggle();
+        });
       }
 
       // The poster overlay is a play affordance whether or not it is a button.
@@ -586,6 +607,7 @@
       if (!this.canFullscreen()) this.setState("no-fullscreen", true);
 
       const sync = () => {
+        this.applyFullscreenControls();
         this.setState("fullscreen", this.isFullscreen());
         this.syncState();
       };
@@ -606,8 +628,8 @@
      */
     canFullscreen() {
       return !!(
-        this.root.requestFullscreen ||
-        this.root.webkitRequestFullscreen ||
+        this.video.requestFullscreen ||
+        this.video.webkitRequestFullscreen ||
         this.video.webkitEnterFullscreen ||
         this.video.webkitSupportsFullscreen
       );
@@ -616,16 +638,28 @@
     /**
      * Whether this player is what is currently fullscreen.
      *
-     * Checks the video as well as the wrapper, because the iPhone route
-     * fullscreens the video element rather than the component.
+     * The wrapper is checked too, in case something outside this library
+     * fullscreens the component.
      *
      * @returns {boolean}
      */
     isFullscreen() {
       const current =
         document.fullscreenElement || document.webkitFullscreenElement || null;
-      if (current) return current === this.root || current === this.video;
+      if (current) return current === this.video || current === this.root;
       return !!this.video.webkitDisplayingFullscreen;
+    }
+
+    /**
+     * Native controls exist only while fullscreen.
+     *
+     * Driven by the actual fullscreen state rather than by our own button,
+     * so it stays correct when fullscreen is entered or left some other
+     * way — Esc, the native close button, or the browser's own context
+     * menu.
+     */
+    applyFullscreenControls() {
+      this.video.controls = this.isFullscreen();
     }
 
     /**
@@ -857,14 +891,18 @@
     }
 
     /**
-     * Enter or leave fullscreen. Three routes, in order of preference:
+     * Enter or leave fullscreen.
      *
-     *   1. Element Fullscreen on the WRAPPER — desktop, Android, iPad. The
-     *      whole component goes fullscreen, so our control bar goes with it.
-     *   2. The webkit-prefixed version of the same — Safari below 16.4.
-     *   3. video.webkitEnterFullscreen() — iPhone, which has no element
-     *      fullscreen at all. This hands playback to Apple's own player,
-     *      with Apple's controls. Nothing can be done about that.
+     * The VIDEO goes fullscreen, not the wrapper. That is deliberate: the
+     * wrapper — and with it our control bar — is then simply not rendered,
+     * and `controls` gives the browser's own bar instead. Custom controls
+     * in fullscreen are a wide surface of per-browser bugs for very little
+     * gain, and iPhone could never support them at all. This way every
+     * platform behaves identically.
+     *
+     * Three routes, in order: the standard API, the webkit-prefixed
+     * version (Safari below 16.4), and video.webkitEnterFullscreen()
+     * (iPhone, which has no Element Fullscreen at all).
      */
     toggleFullscreen() {
       if (this.isFullscreen()) {
@@ -876,15 +914,25 @@
         return;
       }
 
+      // Turn the native bar on BEFORE the request, so fullscreen never
+      // opens on a bare video for a frame. applyFullscreenControls() is
+      // authoritative and corrects this whichever way the request goes.
+      this.video.controls = true;
+
       const request =
-        this.root.requestFullscreen || this.root.webkitRequestFullscreen;
+        this.video.requestFullscreen || this.video.webkitRequestFullscreen;
 
       if (request) {
-        // May reject when called outside a user gesture — that is fine.
-        const result = request.call(this.root);
-        if (result && result.catch) result.catch(() => {});
+        // May reject when called outside a user gesture — that is fine,
+        // but put the controls back if it does.
+        const result = request.call(this.video);
+        if (result && result.catch) {
+          result.catch(() => this.applyFullscreenControls());
+        }
       } else if (this.video.webkitEnterFullscreen) {
         this.video.webkitEnterFullscreen();
+      } else {
+        this.applyFullscreenControls();
       }
     }
 
