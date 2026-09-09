@@ -175,6 +175,7 @@
       this.renderQueued = false;
       this.disabled = false;
       this.isVisible = true;
+      this.fullscreenWatchdog = null;
       /** Cache of the last string written to each text node. */
       this.lastText = new WeakMap();
 
@@ -607,6 +608,7 @@
       if (!this.canFullscreen()) this.setState("no-fullscreen", true);
 
       const sync = () => {
+        this.clearFullscreenWatchdog();
         this.applyFullscreenControls();
         this.setState("fullscreen", this.isFullscreen());
         this.syncState();
@@ -934,6 +936,23 @@
       } else {
         this.applyFullscreenControls();
       }
+
+      // Safety net. A request that neither resolves nor rejects would
+      // otherwise strand the native bar on top of the inline player, which
+      // is a very visible glitch. Cleared by the fullscreenchange handler
+      // the moment fullscreen actually happens.
+      this.clearFullscreenWatchdog();
+      this.fullscreenWatchdog = setTimeout(() => {
+        this.fullscreenWatchdog = null;
+        this.applyFullscreenControls();
+      }, 1000);
+    }
+
+    /** Cancel the pending fullscreen safety net, if there is one. */
+    clearFullscreenWatchdog() {
+      if (!this.fullscreenWatchdog) return;
+      clearTimeout(this.fullscreenWatchdog);
+      this.fullscreenWatchdog = null;
     }
 
     /**
@@ -1140,6 +1159,8 @@
 
       this.observers.forEach((observer) => observer.disconnect());
       this.observers = [];
+
+      this.clearFullscreenWatchdog();
 
       STATE_NAMES.forEach((name) => this.setState(name, false));
       this.root.removeAttribute(OPT + "state");
