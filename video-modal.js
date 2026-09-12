@@ -2,7 +2,7 @@
  * video-modal.js — Mast (GeekyGrowth fork)
  *
  * Companion to modal.js. That file opens and closes <dialog> elements; this
- * one manages whatever video is inside them.
+ * one loads and unloads the video embed inside the YouTube Modal component.
  *
  * ---------------------------------------------------------------------------
  * WHY THIS EXISTS
@@ -10,13 +10,12 @@
  * A closed <dialog> is display:none, so everything inside it is 0x0. A
  * YouTube iframe that loads in that state initialises its player at zero
  * size, picks the smallest poster image it has, and never re-picks — so the
- * first time you open the modal you get a heavily upscaled, blocky thumbnail.
- * Open it a second time and it looks fine, which makes the bug maddening to
- * track down.
+ * first open shows a blocky, upscaled thumbnail. The second open looks fine,
+ * which makes it a maddening bug to track down.
  *
- * The fix is to not load the embed until the dialog is actually open, and to
- * unload it again on close — which also stops playback, so this replaces the
- * usual "reset the src on close" snippet.
+ * So the embed is not loaded until the dialog is open, and it is unloaded
+ * again on close — which also stops playback, replacing the usual
+ * reset-the-src-on-close snippet.
  *
  * Three things fall out of that:
  *   - sharp thumbnails, because the player measures itself at full size
@@ -27,123 +26,71 @@
  * ---------------------------------------------------------------------------
  * MARKUP
  * ---------------------------------------------------------------------------
- * Nothing to configure. Every <dialog> on the page is picked up, and any
- * <iframe> inside one is managed.
+ * Only iframes carrying data-video-modal="embed" are touched, so other
+ * iframes in other dialogs — maps, forms, anything — are left alone.
  *
  *   <dialog>
- *     <iframe data-src="https://www.youtube-nocookie.com/embed/ID?autoplay=1&rel=0"></iframe>
+ *     <iframe
+ *       data-video-modal="embed"
+ *       data-src="https://www.youtube-nocookie.com/embed/ID?autoplay=1&rel=0">
+ *     </iframe>
  *   </dialog>
  *
- * Put the URL in data-src. A plain src is also accepted and moved to data-src
- * on init, but by then it has already loaded once, and it will autoplay at
- * you in the Designer — which is the whole thing we are avoiding.
+ * The iframe must be inside a <dialog>; that dialog is found automatically.
+ *
+ * Put the URL in data-src. A plain src is accepted and moved on init, but by
+ * then it has already loaded once and will autoplay at you in the Designer,
+ * which is the thing we are avoiding.
  *
  * autoplay=1 is worth having: opening the modal is a user gesture, so the
- * player may start immediately instead of making the visitor click twice.
- *
- * Native <video> elements inside a dialog are paused on close. They are not
- * unloaded — they have no third-party player to tear down.
- *
- * ---------------------------------------------------------------------------
- * OPTIONS — attributes on the <dialog>
- * ---------------------------------------------------------------------------
- *   data-video-modal="ignore"           leave this dialog alone entirely
- *   data-video-modal-keep-loaded="true" pause on close instead of unloading,
- *                                       so reopening is instant. Requires
- *                                       enablejsapi=1 on the embed URL.
- *                                       Costs memory and holds the
- *                                       connection open; worth it only when
- *                                       people reopen the same video.
+ * player can start straight away instead of making the visitor click twice.
  *
  * ---------------------------------------------------------------------------
  * API
  * ---------------------------------------------------------------------------
  *   MastVideoModal.init(scope?)   idempotent; call again after CMS renders
- *   MastVideoModal.unloadAll()    stop and unload every managed embed
  */
 (function () {
   "use strict";
 
-  /** Dialogs already wired, so init() can be called as often as you like. */
-  const handled = new WeakSet();
+  /** The only thing this file touches. */
+  const SELECTOR = '[data-video-modal="embed"]';
+
+  /** dialog -> the embeds inside it. */
+  const managed = new WeakMap();
+
+  /** Embeds already parked, so init() can be called as often as you like. */
+  const known = new WeakSet();
 
   /**
-   * The URL this iframe should eventually load.
-   * @param {HTMLIFrameElement} iframe
-   * @returns {string}
-   */
-  function urlFor(iframe) {
-    return iframe.getAttribute("data-src") || iframe.getAttribute("src") || "";
-  }
-
-  /**
-   * Ask a YouTube embed to pause without tearing it down.
-   *
-   * Needs enablejsapi=1 on the embed URL. Without it the message is simply
-   * ignored, which is why this is opt-in — silently doing nothing would be
-   * worse than unloading.
-   *
-   * @param {HTMLIFrameElement} iframe
-   */
-  function pauseEmbed(iframe) {
-    if (!iframe.contentWindow) return;
-    try {
-      iframe.contentWindow.postMessage(
-        '{"event":"command","func":"pauseVideo","args":""}',
-        "*"
-      );
-    } catch (error) {
-      /* frame not ready, or not a player that speaks this protocol */
-    }
-  }
-
-  /**
-   * Wire one dialog.
+   * Promote every parked URL in this dialog to a real src.
    * @param {HTMLDialogElement} dialog
-   * @returns {boolean} whether it was newly wired
    */
-  function setupDialog(dialog) {
-    if (handled.has(dialog)) return false;
-    if (dialog.getAttribute("data-video-modal") === "ignore") return false;
-
-    const frames = [];
-
-    dialog.querySelectorAll("iframe").forEach(function (iframe) {
-      const url = urlFor(iframe);
-      if (!url) return;
-
-      // Park the URL. removeAttribute rather than src="" — an empty src
-      // makes some browsers load the current page into the iframe.
-      iframe.setAttribute("data-src", url);
-      iframe.removeAttribute("src");
-      frames.push(iframe);
+  function load(dialog) {
+    (managed.get(dialog) || []).forEach(function (iframe) {
+      if (iframe.getAttribute("src")) return;
+      iframe.setAttribute("src", iframe.getAttribute("data-src"));
     });
+  }
 
-    const videos = dialog.querySelectorAll("video");
-    if (!frames.length && !videos.length) return false;
+  /**
+   * Tear the embeds down, which is what stops playback.
+   * @param {HTMLDialogElement} dialog
+   */
+  function unload(dialog) {
+    (managed.get(dialog) || []).forEach(function (iframe) {
+      iframe.removeAttribute("src");
+    });
+  }
 
-    handled.add(dialog);
-
-    const keepLoaded =
-      dialog.getAttribute("data-video-modal-keep-loaded") === "true";
-
-    function load() {
-      frames.forEach(function (iframe) {
-        if (iframe.getAttribute("src")) return;
-        iframe.setAttribute("src", iframe.getAttribute("data-src"));
-      });
-    }
-
-    function stop() {
-      frames.forEach(function (iframe) {
-        if (keepLoaded) pauseEmbed(iframe);
-        else iframe.removeAttribute("src");
-      });
-      videos.forEach(function (video) {
-        video.pause();
-      });
-    }
-
+  /**
+   * Start following a dialog's open state. Called once per dialog; the
+   * handlers read the embed list at call time, so embeds discovered by a
+   * later init() are picked up without a second observer.
+   *
+   * @param {HTMLDialogElement} dialog
+   */
+  function watch(dialog) {
     // <dialog> fires "close" but has no matching "open" event, and modal.js
     // is what calls showModal() — so watch the attribute rather than trying
     // to hook whichever button happened to open it.
@@ -153,55 +100,67 @@
     // the video never loading for anyone who opened the modal in one.
     // Layout is recalculated before the iframe's document loads anyway.
     new MutationObserver(function () {
-      if (dialog.open) load();
-      else stop();
+      if (dialog.open) load(dialog);
+      else unload(dialog);
     }).observe(dialog, { attributes: true, attributeFilter: ["open"] });
 
-    // Also catch close directly: Esc and <form method="dialog"> both fire it.
-    dialog.addEventListener("close", stop);
-
-    // modal.js can open a dialog on load, before we got here.
-    if (dialog.open) load();
-
-    return true;
+    // Esc and <form method="dialog"> both fire close without necessarily
+    // going through anything else we can see.
+    dialog.addEventListener("close", function () {
+      unload(dialog);
+    });
   }
 
   /**
-   * Find every dialog in `scope` and wire it up.
+   * Find every embed in `scope` and wire up the dialog around it.
    *
-   * Safe to call repeatedly — dialogs already wired are skipped — so this is
+   * Safe to call repeatedly — embeds already parked are skipped — so this is
    * the hook to use after a CMS list or a component injects new markup.
    *
    * @param {ParentNode} [scope=document]
-   * @returns {number} how many dialogs were newly wired
+   * @returns {number} how many embeds were newly parked
    */
   function init(scope) {
     const root = scope || document;
-    const dialogs = root.querySelectorAll("dialog");
+    const embeds = root.querySelectorAll(SELECTOR);
 
-    // Early exit: most pages have no dialogs at all.
-    if (!dialogs.length) return 0;
+    // Early exit: most pages have no video modal on them at all.
+    if (!embeds.length) return 0;
 
-    let wired = 0;
-    dialogs.forEach(function (dialog) {
-      if (setupDialog(dialog)) wired++;
+    let parked = 0;
+
+    embeds.forEach(function (iframe) {
+      if (known.has(iframe)) return;
+
+      const dialog = iframe.closest("dialog");
+      if (!dialog) return;
+
+      const url = iframe.getAttribute("data-src") || iframe.getAttribute("src");
+      if (!url) return;
+
+      // Park the URL. removeAttribute rather than src="" — an empty src
+      // makes some browsers load the current page into the iframe.
+      iframe.setAttribute("data-src", url);
+      iframe.removeAttribute("src");
+
+      known.add(iframe);
+      parked++;
+
+      if (managed.has(dialog)) {
+        managed.get(dialog).push(iframe);
+      } else {
+        managed.set(dialog, [iframe]);
+        watch(dialog);
+      }
+
+      // modal.js can open a dialog on load, before we got here.
+      if (dialog.open) load(dialog);
     });
-    return wired;
+
+    return parked;
   }
 
-  const api = {
-    init: init,
-
-    /** Stop and unload every managed embed, wherever it is. */
-    unloadAll: function () {
-      document.querySelectorAll("dialog iframe[data-src]").forEach(function (iframe) {
-        iframe.removeAttribute("src");
-      });
-      document.querySelectorAll("dialog video").forEach(function (video) {
-        video.pause();
-      });
-    },
-  };
+  const api = { init: init };
 
   window.MastVideoModal = api;
 
