@@ -15,6 +15,7 @@
  *   visitor prefers reduced motion. Pressing play overrides hover and focus pauses.
  * - Tabs components nested inside a pane are independent of their parent.
  * - Tabs hidden with display: none are skipped by the arrow keys, Home/End and autoplay.
+ * - Vertical menus accept Up/Down and Left/Right (they often turn horizontal on mobile).
  * - Safe to run twice: a component that was already initialized is cleaned up first.
  *
  * Versions: v1.x = original Mast tabs (legacy cover-button markup). v2.x = this script.
@@ -629,25 +630,27 @@
         }
 
         /**
-         * Setup keyboard navigation (Left/Right, or Up/Down for vertical menus; Home, End, Enter, Space)
+         * Setup keyboard navigation (Left/Right; vertical menus also Up/Down, because they
+         * often turn horizontal on mobile; Home, End, Enter, Space)
          */
         function setupKeyboardNav() {
-            const prevKey = isVertical ? 'ArrowUp' : 'ArrowLeft';
-            const nextKey = isVertical ? 'ArrowDown' : 'ArrowRight';
+            const prevKeys = isVertical ? ['ArrowUp', 'ArrowLeft'] : ['ArrowLeft'];
+            const nextKeys = isVertical ? ['ArrowDown', 'ArrowRight'] : ['ArrowRight'];
 
             tabLinksArray.forEach((link, index) => {
                 on(link, 'keydown', (e) => {
                     let newIndex = currentActiveIndex;
+                    const key = prevKeys.includes(e.key) ? 'prev' : nextKeys.includes(e.key) ? 'next' : e.key;
 
-                    switch (e.key) {
+                    switch (key) {
                         case 'Enter':
                         case ' ':
                             newIndex = index;
                             break;
-                        case prevKey:
+                        case 'prev':
                             newIndex = findAvailableIndex(currentActiveIndex, -1);
                             break;
-                        case nextKey:
+                        case 'next':
                             newIndex = findAvailableIndex(currentActiveIndex, 1);
                             break;
                         case 'Home':
