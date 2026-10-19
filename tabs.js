@@ -1,48 +1,81 @@
-(function() {
+/**
+ * Mast Tabs (GeekyGrowth fork)
+ *
+ * Based on Mast's tabs.js and the sibe.io refactor. Adds:
+ * - The [data-tabs-link] wrapper is the tab (roving tabindex, ids, aria-controls / aria-labelledby).
+ * - Legacy markup still works: a [data-tabs-link-button] cover button is made inert and
+ *   click-through, so the tab itself takes focus and clicks.
+ * - role="tablist" lives on [data-tabs-menu-wrapper] (moved there at runtime if the markup
+ *   still has it on [data-tabs-menu]).
+ * - Per-tab autoplay duration via data-tabs-link-duration (empty values are ignored).
+ * - Pane videos follow the autoplay state; the Webflow video play/pause button also
+ *   pauses and resumes autoplay.
+ * - Autoplay pauses while keyboard focus is inside the component (or any focus inside a
+ *   pane) and while the browser tab is in the background, and starts paused when the
+ *   visitor prefers reduced motion. Pressing play overrides hover and focus pauses.
+ * - Tabs components nested inside a pane are independent of their parent.
+ * - Safe to run twice: a component that was already initialized is cleaned up first.
+ *
+ * Versions: v1.x = original Mast tabs (legacy cover-button markup). v2.x = this script.
+ */
+(function () {
     'use strict';
 
-    // Early exit if no tabs components exist on the page
-    const tabComponents = document.querySelectorAll('[data-tabs-component]');
-    if (!tabComponents.length) {
-        return;
-    }
+    // Tab names that are really just the component default, so the visible text is used instead
+    const PLACEHOLDER_NAMES = ['tab'];
+
+    const prefersReducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     /**
      * Initialize a single tabs component
      */
     function initTabsComponent(component) {
-        const tabMenu = component.querySelector('[data-tabs-menu]');
-        const dropdownMenu = component.querySelector('[data-tabs-menu-dropdown-menu]');
-        const tabMenuWrapper = component.querySelector('[data-tabs-menu-wrapper]');
-        const tabLinks = component.querySelectorAll('[data-tabs-link]');
-        const tabPanes = component.querySelectorAll('[data-tabs-pane]');
+        // Already initialized (script loaded twice, or re-init after a DOM change)
+        if (typeof component.__tabsCleanup === 'function') {
+            component.__tabsCleanup();
+        }
 
-        if (!tabMenu || !dropdownMenu || !tabMenuWrapper || !tabLinks.length || !tabPanes.length) {
+        // Only this component's own elements, never those of a tabs component nested in a pane
+        const ownAll = (selector) => Array.from(component.querySelectorAll(selector)).filter((el) => el.closest('[data-tabs-component]') === component);
+        const own = (selector) => ownAll(selector)[0] || null;
+
+        const tabMenu = own('[data-tabs-menu]');
+        const dropdownMenu = own('[data-tabs-menu-dropdown-menu]');
+        const tabMenuWrapper = own('[data-tabs-menu-wrapper]');
+        const tabLinksArray = ownAll('[data-tabs-link]');
+        const tabPanesArray = ownAll('[data-tabs-pane]');
+
+        if (!tabMenu || !dropdownMenu || !tabMenuWrapper || !tabLinksArray.length || !tabPanesArray.length) {
             return;
         }
 
-        // Convert NodeLists to arrays once for better performance
-        const tabLinksArray = Array.from(tabLinks);
-        const tabPanesArray = Array.from(tabPanes);
-
         // State
         let currentActiveIndex = 0;
-        let dropdownToggle = tabMenu.querySelector('[data-tabs-menu-dropdown-toggle]');
-        let dropdownText = dropdownToggle ? dropdownToggle.querySelector('[data-tabs-menu-dropdown-text]') : null;
-        let isMobileDropdown = tabMenu.getAttribute('data-tab-mobile-dropdown') === 'true';
+        const dropdownToggle = own('[data-tabs-menu-dropdown-toggle]');
+        const dropdownText = dropdownToggle ? dropdownToggle.querySelector('[data-tabs-menu-dropdown-text]') : null;
+        const isMobileDropdown = tabMenu.getAttribute('data-tab-mobile-dropdown') === 'true';
+        const isVertical = tabMenu.getAttribute('data-wf--tabs-menu--settings-alignment') === 'vertical';
 
         // Cache autoplay toggle button
-        let autoplayToggleButton = component.querySelector('[data-tabs-autoplay-toggle]');
+        const autoplayToggleButton = own('[data-tabs-autoplay-toggle]');
 
-        // Autoplay state
-        let autoplayEnabled = tabMenu.getAttribute('data-tabs-autoplay') === 'true';
-        let autoplayDuration = parseFloat(tabMenu.getAttribute('data-tabs-autoplay-duration')) || 5;
-        let autoplayHoverPause = tabMenu.getAttribute('data-tabs-autoplay-hover-pause') === 'true';
+        // Autoplay state (a single tab has nothing to rotate to)
+        const autoplayEnabled = tabMenu.getAttribute('data-tabs-autoplay') === 'true' && tabLinksArray.length > 1;
+        const autoplayDuration = parseDuration(tabMenu.getAttribute('data-tabs-autoplay-duration')) || 5;
+        const autoplayHoverPause = tabMenu.getAttribute('data-tabs-autoplay-hover-pause') === 'true';
+        let currentTabDuration = autoplayDuration;
         let autoplayTimer = null;
         let autoplayObserver = null;
-        let isAutoplayPaused = false;
         let autoplayStartTime = null;
         let autoplayElapsedTime = 0;
+
+        // Why autoplay is paused. Autoplay runs only while this set is empty.
+        // 'user'      - play/pause toggle, video button, or reduced motion
+        // 'hover'     - pointer over the component (only with data-tabs-autoplay-hover-pause)
+        // 'focus'     - keyboard focus inside the component, or any focus inside a pane
+        // 'offscreen' - component scrolled out of view
+        // 'hidden'    - browser tab in the background
+        const pauseReasons = new Set();
 
         // Cache window width for responsive checks
         let cachedWindowWidth = window.innerWidth;
@@ -50,6 +83,164 @@
 
         // Event listener references for cleanup
         const eventListeners = [];
+
+        function on(element, type, handler, capture) {
+            element.addEventListener(type, handler, !!capture);
+            eventListeners.push({ element, type, handler, capture: !!capture });
+        }
+
+        function isAutoplayPaused() {
+            return pauseReasons.size > 0;
+        }
+
+        /**
+         * The tab's accessible name: data-tab-link-name, unless it is empty or a placeholder
+         */
+        function getTabName(link) {
+            const name = (link.getAttribute('data-tab-link-name') || '').trim();
+            if (!name || PLACEHOLDER_NAMES.includes(name.toLowerCase())) return '';
+            return name;
+        }
+
+        /**
+         * Accessible tab semantics. The [data-tabs-link] wrapper is the tab.
+         */
+        function setupTabSemantics() {
+            const uid = 'tabs-' + Math.random().toString(36).slice(2, 7);
+
+            // The tablist should only contain tabs, so it belongs on the wrapper, not the menu
+            // (the menu also holds the mobile dropdown toggle)
+            if (tabMenu.getAttribute('role') === 'tablist') {
+                tabMenu.removeAttribute('role');
+            }
+            tabMenuWrapper.setAttribute('role', 'tablist');
+            if (isVertical) {
+                tabMenuWrapper.setAttribute('aria-orientation', 'vertical');
+            }
+
+            tabLinksArray.forEach((link, i) => {
+                link.setAttribute('role', 'tab');
+                if (!link.id) link.id = uid + '-tab-' + i;
+
+                const name = getTabName(link);
+                if (name) link.setAttribute('aria-label', name);
+
+                // Legacy markup: the cover button is no longer the tab. It's made inert (no focus,
+                // no accessibility tree, not a nested control) and clicks pass through to the tab.
+                link.querySelectorAll('[data-tabs-link-button]').forEach((overlay) => {
+                    overlay.setAttribute('tabindex', '-1');
+                    overlay.setAttribute('aria-hidden', 'true');
+                    overlay.inert = true;
+                    overlay.style.pointerEvents = 'none';
+                    link.style.cursor = 'pointer';
+                });
+
+                // The progress bar is decoration
+                link.querySelectorAll('[data-tabs-autoplay-progress]').forEach((bar) => {
+                    bar.setAttribute('aria-hidden', 'true');
+                });
+
+                const pane = tabPanesArray[i];
+                if (pane) {
+                    if (!pane.id) pane.id = uid + '-panel-' + i;
+                    pane.setAttribute('role', 'tabpanel');
+                    pane.setAttribute('aria-labelledby', link.id);
+                    link.setAttribute('aria-controls', pane.id);
+
+                    // A panel without focusable content gets a Tab stop, so keyboard users can reach it
+                    const hasFocusable = pane.querySelector('a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])');
+                    if (!hasFocusable && !pane.hasAttribute('tabindex')) {
+                        pane.setAttribute('tabindex', '0');
+                    }
+                }
+            });
+
+            if (autoplayToggleButton) {
+                if (autoplayToggleButton.tagName === 'BUTTON' && !autoplayToggleButton.hasAttribute('type')) {
+                    autoplayToggleButton.setAttribute('type', 'button');
+                }
+                // Without autoplay the toggle has nothing to control (inline style, because
+                // the hidden attribute loses against the class's display value)
+                if (!autoplayEnabled) autoplayToggleButton.style.display = 'none';
+            }
+        }
+
+        /**
+         * Pane videos follow the autoplay state.
+         * Only the active pane's video plays, and only while autoplay is running,
+         * so the video and the progress bar always start, pause and restart together.
+         * Selects every <video> inside a pane (Webflow Background Video renders one),
+         * so a client-swapped video needs no extra attribute. Tabs without autoplay
+         * are left alone.
+         */
+        // A pane's own videos, not those inside a nested tabs component's panes
+        function paneVideos(pane) {
+            return Array.from(pane.querySelectorAll('video')).filter((video) => video.closest('[data-tabs-pane]') === pane);
+        }
+
+        function shouldPaneVideoPlay(paneIndex) {
+            return paneIndex === currentActiveIndex && !isAutoplayPaused();
+        }
+
+        function syncPaneVideos(restart) {
+            if (!autoplayEnabled) return;
+
+            tabPanesArray.forEach((pane, i) => {
+                paneVideos(pane).forEach((video) => {
+                    if (restart && i === currentActiveIndex) {
+                        video.currentTime = 0;
+                    }
+                    if (shouldPaneVideoPlay(i)) {
+                        const playing = video.play(); // rejected if the video is not muted
+                        if (playing && typeof playing.catch === 'function') playing.catch(() => {});
+                    } else {
+                        video.pause();
+                    }
+                });
+            });
+        }
+
+        // Webflow's own autoplay can start a video at any time - pause it again
+        // whenever it is not the one that should be playing
+        function guardPaneVideos() {
+            if (!autoplayEnabled) return;
+
+            tabPanesArray.forEach((pane, i) => {
+                paneVideos(pane).forEach((video) => {
+                    on(video, 'play', () => {
+                        if (!shouldPaneVideoPlay(i)) video.pause();
+                    });
+
+                    // Keep Webflow's play/pause icon in step when this script plays or pauses the video
+                    const iconHandler = () => syncVideoButton(pane, video);
+                    on(video, 'play', iconHandler);
+                    on(video, 'pause', iconHandler);
+                });
+
+                // The video's play/pause button also pauses/resumes autoplay.
+                // Capture phase, so the state is set before Webflow's own handler toggles the video.
+                on(pane, 'click', (e) => {
+                    if (!e.target.closest('[data-w-bg-video-control]')) return;
+                    const video = e.target.closest('[data-tabs-pane]') === pane ? paneVideos(pane)[0] : null;
+                    if (!video) return;
+
+                    if (video.paused) {
+                        userResume(false); // Webflow plays the video itself
+                    } else {
+                        addPause('user', false); // Webflow pauses the video itself
+                    }
+                }, true);
+            });
+        }
+
+        // Webflow's button only swaps its icon when it is clicked itself.
+        // Its two <span>s are Webflow-generated (no hook possible): [0] = pause icon, [1] = play icon.
+        function syncVideoButton(pane, video) {
+            const button = pane.querySelector('[data-w-bg-video-control]');
+            if (!button || button.children.length < 2) return;
+            button.children[0].hidden = video.paused;
+            button.children[1].hidden = !video.paused;
+        }
 
         /**
          * Set the active tab by index
@@ -59,32 +250,17 @@
                 return;
             }
 
-            // Batch DOM reads and writes to avoid layout thrashing
-            const overlays = [];
-            const isActiveStates = [];
-
-            // Phase 1: Read from DOM
+            // The wrapper is the tab: roving tabindex, only the active tab is in the Tab order
             for (let i = 0; i < tabLinksArray.length; i++) {
                 const link = tabLinksArray[i];
-                const overlay = link.querySelector('[data-tabs-link-button]');
-                overlays.push(overlay);
-                isActiveStates.push(i === index);
-            }
-
-            // Phase 2: Write to DOM (batch updates)
-            for (let i = 0; i < tabLinksArray.length; i++) {
-                const link = tabLinksArray[i];
-                const isActive = isActiveStates[i];
+                const isActive = i === index;
 
                 link.setAttribute('aria-selected', isActive);
+                link.setAttribute('tabindex', isActive ? '0' : '-1');
                 link.classList.toggle('cc-active', isActive);
-
-                if (overlays[i]) {
-                    overlays[i].setAttribute('tabindex', isActive ? '0' : '-1');
-                }
             }
 
-            // Update tab panes
+            // Update tab panes (hidden by CSS: .tabs-pane[aria-hidden="true"])
             for (let i = 0; i < tabPanesArray.length; i++) {
                 tabPanesArray[i].setAttribute('aria-hidden', i !== index);
             }
@@ -93,8 +269,7 @@
 
             // Update dropdown toggle text if it exists
             if (dropdownText && isMobileDropdown) {
-                const activeTabName = tabLinksArray[index].getAttribute('data-tab-link-name');
-                dropdownText.textContent = activeTabName || tabLinksArray[index].textContent;
+                dropdownText.textContent = getTabName(tabLinksArray[index]) || tabLinksArray[index].textContent.trim();
             }
 
             // Close dropdown if open
@@ -107,30 +282,35 @@
                 const activeLink = tabLinksArray[index];
                 const scrollContainer = tabMenuWrapper;
 
-                // Batch read operations
                 const containerLeft = scrollContainer.scrollLeft;
                 const containerWidth = scrollContainer.clientWidth;
                 const tabLeft = activeLink.offsetLeft;
                 const tabWidth = activeLink.offsetWidth;
 
-                // Scroll to show the tab on the left side of the container
                 if (tabLeft < containerLeft || tabLeft + tabWidth > containerLeft + containerWidth) {
                     scrollContainer.scrollTo({
                         left: tabLeft,
-                        behavior: 'smooth'
+                        behavior: prefersReducedMotion ? 'auto' : 'smooth',
                     });
                 }
             }
 
+            // Per-tab duration, falling back to the menu's duration
+            currentTabDuration = parseDuration(tabLinksArray[index].getAttribute('data-tabs-link-duration')) || autoplayDuration;
+            component.style.setProperty('--autoplay-duration', `${currentTabDuration}s`);
+
             // Restart autoplay if enabled
             if (autoplayEnabled) {
-                if (isAutoplayPaused) {
-                    // Reset elapsed time when manually switching tabs while paused
+                if (isAutoplayPaused()) {
                     autoplayElapsedTime = 0;
+                    resetProgressBar();
                 } else {
                     restartAutoplay();
                 }
             }
+
+            // New tab's video starts from 0; it only plays if autoplay is running
+            syncPaneVideos(true);
         }
 
         /**
@@ -170,45 +350,31 @@
         function setupMobileDropdown() {
             if (!isMobileDropdown || !dropdownToggle) return;
 
-            // Set initial aria attributes
             dropdownToggle.setAttribute('aria-haspopup', 'true');
             dropdownToggle.setAttribute('aria-expanded', 'false');
 
-            // Set initial text to active tab
-            const activeLink = component.querySelector('[data-tabs-link][aria-selected="true"]') ||
-                              component.querySelector('[data-tabs-link].cc-active') ||
-                              tabLinksArray[0];
+            const activeLink = tabLinksArray.find((link) => link.getAttribute('aria-selected') === 'true') || tabLinksArray.find((link) => link.classList.contains('cc-active')) || tabLinksArray[0];
             if (dropdownText && activeLink) {
-                const activeTabName = activeLink.getAttribute('data-tab-link-name');
-                dropdownText.textContent = activeTabName || activeLink.textContent;
+                dropdownText.textContent = getTabName(activeLink) || activeLink.textContent.trim();
             }
 
-            // Toggle dropdown on click
-            const toggleHandler = function(e) {
+            on(dropdownToggle, 'click', (e) => {
                 e.stopPropagation();
                 toggleDropdown();
-            };
-            dropdownToggle.addEventListener('click', toggleHandler);
-            eventListeners.push({ element: dropdownToggle, type: 'click', handler: toggleHandler });
+            });
 
-            // Close dropdown when clicking outside - use delegation on document
-            const outsideClickHandler = function(e) {
+            on(document, 'click', (e) => {
                 if (!component.contains(e.target)) {
                     closeDropdown();
                 }
-            };
-            document.addEventListener('click', outsideClickHandler);
-            eventListeners.push({ element: document, type: 'click', handler: outsideClickHandler });
+            });
 
-            // Close on escape key - use delegation on document
-            const escapeHandler = function(e) {
+            on(document, 'keydown', (e) => {
                 if (e.key === 'Escape' && dropdownMenu.classList.contains('cc-open')) {
                     closeDropdown();
                     dropdownToggle.focus();
                 }
-            };
-            document.addEventListener('keydown', escapeHandler);
-            eventListeners.push({ element: document, type: 'keydown', handler: escapeHandler });
+            });
         }
 
         /**
@@ -216,20 +382,19 @@
          */
         function setupAutoplayProgressBars() {
             if (!autoplayEnabled) return;
-
-            // Set CSS variable for duration
-            component.style.setProperty('--autoplay-duration', `${autoplayDuration}s`);
+            component.style.setProperty('--autoplay-duration', `${currentTabDuration}s`);
         }
 
         /**
          * Start autoplay
          */
         function startAutoplay() {
-            if (!autoplayEnabled || isAutoplayPaused) return;
+            if (!autoplayEnabled || isAutoplayPaused()) return;
 
             stopAutoplay();
 
-            const remainingTime = (autoplayDuration * 1000) - autoplayElapsedTime;
+            const remainingTime = Math.max(0, currentTabDuration * 1000 - autoplayElapsedTime);
+
             autoplayStartTime = Date.now();
 
             autoplayTimer = setTimeout(() => {
@@ -250,89 +415,124 @@
         }
 
         /**
+         * Restart the active tab's progress bar animation from 0
+         */
+        function resetProgressBar() {
+            const progressBar = tabLinksArray[currentActiveIndex].querySelector('[data-tabs-autoplay-progress]');
+            if (!progressBar) return;
+
+            progressBar.style.animation = 'none';
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    progressBar.style.animation = '';
+                });
+            });
+        }
+
+        /**
          * Restart autoplay (used when manually switching tabs)
          */
         function restartAutoplay() {
             if (!autoplayEnabled) return;
 
-            // Reset elapsed time
             autoplayElapsedTime = 0;
-
-            // Remove and re-add animation to restart it
-            const activeLink = tabLinksArray[currentActiveIndex];
-            const progressBar = activeLink.querySelector('[data-tabs-autoplay-progress]');
-
-            if (progressBar) {
-                // Use requestAnimationFrame for smoother animation restart
-                progressBar.style.animation = 'none';
-                requestAnimationFrame(() => {
-                    requestAnimationFrame(() => {
-                        progressBar.style.animation = '';
-                    });
-                });
-            }
-
+            resetProgressBar();
             startAutoplay();
         }
 
         /**
-         * Update toggle button aria-label
+         * Reflect the paused state on the component class and the toggle's aria-label
          */
-        function updateToggleButton() {
-            if (!autoplayToggleButton) return;
+        function updatePausedState() {
+            const paused = isAutoplayPaused();
+            component.classList.toggle('autoplay-paused', paused);
 
-            if (isAutoplayPaused) {
-                autoplayToggleButton.setAttribute('aria-label', 'Play autoplay');
-            } else {
-                autoplayToggleButton.setAttribute('aria-label', 'Pause autoplay');
+            if (autoplayToggleButton) {
+                autoplayToggleButton.setAttribute('aria-label', paused ? 'Play autoplay' : 'Pause autoplay');
             }
         }
 
         /**
-         * Pause autoplay
+         * Add a pause reason. Pauses autoplay if it was running.
          */
-        function pauseAutoplay() {
-            if (!autoplayEnabled) return;
+        function addPause(reason, syncVideos = true) {
+            if (!autoplayEnabled || pauseReasons.has(reason)) return;
 
-            // Calculate elapsed time
-            if (autoplayStartTime !== null) {
-                autoplayElapsedTime += Date.now() - autoplayStartTime;
+            const wasRunning = !isAutoplayPaused();
+            pauseReasons.add(reason);
+
+            if (wasRunning) {
+                if (autoplayStartTime !== null) {
+                    autoplayElapsedTime += Date.now() - autoplayStartTime;
+                }
+                stopAutoplay();
+                if (syncVideos) syncPaneVideos(false);
             }
-
-            isAutoplayPaused = true;
-            component.classList.add('autoplay-paused');
-            stopAutoplay();
-            updateToggleButton();
+            updatePausedState();
         }
 
         /**
-         * Resume autoplay
+         * Remove a pause reason. Resumes autoplay once no reason is left.
          */
-        function resumeAutoplay() {
-            if (!autoplayEnabled) return;
-            isAutoplayPaused = false;
-            component.classList.remove('autoplay-paused');
-            startAutoplay();
-            updateToggleButton();
+        function removePause(reason, syncVideos = true) {
+            if (!autoplayEnabled || !pauseReasons.has(reason)) return;
+
+            pauseReasons.delete(reason);
+
+            if (!isAutoplayPaused()) {
+                startAutoplay();
+                if (syncVideos) syncPaneVideos(false);
+            }
+            updatePausedState();
+        }
+
+        /**
+         * The visitor explicitly asked to play: this overrides hover and focus pauses
+         * (but not 'offscreen', which clears itself when the component scrolls back in)
+         */
+        function userResume(syncVideos = true) {
+            pauseReasons.delete('hover');
+            pauseReasons.delete('focus');
+            pauseReasons.add('user'); // so removePause runs its resume logic
+            removePause('user', syncVideos);
         }
 
         /**
          * Setup intersection observer for autoplay
          */
         function setupAutoplayObserver() {
-            if (!autoplayEnabled) return;
+            if (!autoplayEnabled || !('IntersectionObserver' in window)) return;
 
-            autoplayObserver = new IntersectionObserver((entries) => {
-                entries.forEach(entry => {
-                    if (entry.isIntersecting) {
-                        resumeAutoplay();
-                    } else {
-                        pauseAutoplay();
-                    }
-                });
-            }, { threshold: 0.5 });
+            autoplayObserver = new IntersectionObserver(
+                (entries) => {
+                    entries.forEach((entry) => {
+                        if (entry.isIntersecting) {
+                            removePause('offscreen');
+                        } else {
+                            addPause('offscreen');
+                        }
+                    });
+                },
+                { threshold: 0.5 },
+            );
 
             autoplayObserver.observe(component);
+        }
+
+        /**
+         * Pause while the browser tab is in the background, so the visitor
+         * doesn't come back to a tab that rotated on without them
+         */
+        function setupAutoplayVisibilityPause() {
+            if (!autoplayEnabled) return;
+
+            on(document, 'visibilitychange', () => {
+                if (document.hidden) {
+                    addPause('hidden');
+                } else {
+                    removePause('hidden');
+                }
+            });
         }
 
         /**
@@ -341,18 +541,34 @@
         function setupAutoplayHoverPause() {
             if (!autoplayEnabled || !autoplayHoverPause) return;
 
-            const mouseEnterHandler = () => {
-                pauseAutoplay();
-            };
-            const mouseLeaveHandler = () => {
-                resumeAutoplay();
-            };
+            on(component, 'mouseenter', () => addPause('hover'));
+            on(component, 'mouseleave', () => removePause('hover'));
+        }
 
-            component.addEventListener('mouseenter', mouseEnterHandler);
-            component.addEventListener('mouseleave', mouseLeaveHandler);
+        /**
+         * Pause autoplay while keyboard focus is inside the component, so content doesn't
+         * change under a keyboard or screen reader user. Any focus inside a pane (also a mouse
+         * click) pauses too, otherwise the next tab change would hide the focused element.
+         */
+        function setupAutoplayFocusPause() {
+            if (!autoplayEnabled) return;
 
-            eventListeners.push({ element: component, type: 'mouseenter', handler: mouseEnterHandler });
-            eventListeners.push({ element: component, type: 'mouseleave', handler: mouseLeaveHandler });
+            on(component, 'focusin', (e) => {
+                let isKeyboardFocus = true;
+                try {
+                    isKeyboardFocus = e.target.matches(':focus-visible');
+                } catch (err) {
+                    // Browsers without :focus-visible: treat every focus as keyboard focus
+                }
+                const inPane = tabPanesArray.some((pane) => pane.contains(e.target));
+                if (isKeyboardFocus || inPane) addPause('focus');
+            });
+
+            on(component, 'focusout', (e) => {
+                if (!e.relatedTarget || !component.contains(e.relatedTarget)) {
+                    removePause('focus');
+                }
+            });
         }
 
         /**
@@ -361,86 +577,73 @@
         function setupAutoplayToggle() {
             if (!autoplayEnabled || !autoplayToggleButton) return;
 
-            const toggleHandler = () => {
-                if (isAutoplayPaused) {
-                    resumeAutoplay();
+            on(autoplayToggleButton, 'click', () => {
+                if (isAutoplayPaused()) {
+                    userResume();
                 } else {
-                    pauseAutoplay();
+                    addPause('user');
                 }
-            };
-
-            autoplayToggleButton.addEventListener('click', toggleHandler);
-            eventListeners.push({ element: autoplayToggleButton, type: 'click', handler: toggleHandler });
+            });
         }
 
         /**
          * Find initial active tab index
          */
         function findInitialActiveIndex() {
-            // Check for URL hash match
             if (window.location.hash) {
                 const hash = window.location.hash.substring(1);
-                const matchIndex = tabLinksArray.findIndex(link => link.id === hash);
+                const matchIndex = tabLinksArray.findIndex((link) => link.id === hash);
                 if (matchIndex !== -1) {
                     return matchIndex;
                 }
             }
 
-            // Check for cc-active class
-            const customActiveIndex = tabLinksArray.findIndex(
-                link => link.classList.contains('cc-active')
-            );
+            const customActiveIndex = tabLinksArray.findIndex((link) => link.classList.contains('cc-active'));
             if (customActiveIndex !== -1) {
                 return customActiveIndex;
             }
 
-            // Default to first tab
             return 0;
         }
 
         /**
-         * Setup keyboard navigation
+         * Setup keyboard navigation (Left/Right, or Up/Down for vertical menus; Home, End, Enter, Space)
          */
         function setupKeyboardNav() {
             const tabLinksLength = tabLinksArray.length;
+            const prevKey = isVertical ? 'ArrowUp' : 'ArrowLeft';
+            const nextKey = isVertical ? 'ArrowDown' : 'ArrowRight';
 
-            tabLinksArray.forEach((link) => {
-                const overlay = link.querySelector('[data-tabs-link-button]');
-                if (!overlay) return;
-
-                const keydownHandler = function(e) {
+            tabLinksArray.forEach((link, index) => {
+                on(link, 'keydown', (e) => {
                     let newIndex = currentActiveIndex;
 
-                    switch(e.key) {
-                        case 'ArrowLeft':
-                            e.preventDefault();
+                    switch (e.key) {
+                        case 'Enter':
+                        case ' ':
+                            newIndex = index;
+                            break;
+                        case prevKey:
                             newIndex = currentActiveIndex > 0 ? currentActiveIndex - 1 : tabLinksLength - 1;
                             break;
-                        case 'ArrowRight':
-                            e.preventDefault();
+                        case nextKey:
                             newIndex = currentActiveIndex < tabLinksLength - 1 ? currentActiveIndex + 1 : 0;
                             break;
                         case 'Home':
-                            e.preventDefault();
                             newIndex = 0;
                             break;
                         case 'End':
-                            e.preventDefault();
                             newIndex = tabLinksLength - 1;
                             break;
                         default:
                             return;
                     }
 
+                    e.preventDefault();
+                    removePause('user');
                     setActiveTab(newIndex);
-                    const nextOverlay = tabLinksArray[newIndex].querySelector('[data-tabs-link-button]');
-                    if (nextOverlay) {
-                        nextOverlay.focus();
-                    }
-                };
-
-                overlay.addEventListener('keydown', keydownHandler);
-                eventListeners.push({ element: overlay, type: 'keydown', handler: keydownHandler });
+                    tabLinksArray[newIndex].focus();
+                });
             });
         }
 
@@ -449,21 +652,15 @@
          */
         function setupClickHandlers() {
             tabLinksArray.forEach((link, index) => {
-                const overlay = link.querySelector('[data-tabs-link-button]');
-                if (!overlay) return;
-
-                const clickHandler = function(e) {
+                on(link, 'click', (e) => {
                     e.preventDefault();
+                    removePause('user');
                     setActiveTab(index);
 
-                    // Scroll the active tab into view on mobile - use cached width
                     if (cachedWindowWidth < 768 && !isMobileDropdown) {
-                        link.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+                        link.scrollIntoView({ behavior: prefersReducedMotion ? 'auto' : 'smooth', block: 'nearest', inline: 'center' });
                     }
-                };
-
-                overlay.addEventListener('click', clickHandler);
-                eventListeners.push({ element: overlay, type: 'click', handler: clickHandler });
+                });
             });
         }
 
@@ -471,84 +668,84 @@
          * Setup window resize handler
          */
         function setupResizeHandler() {
-            const resizeHandler = function() {
-                // Debounce resize events
+            on(window, 'resize', () => {
                 clearTimeout(resizeTimer);
                 resizeTimer = setTimeout(() => {
                     cachedWindowWidth = window.innerWidth;
                 }, 150);
-            };
-
-            window.addEventListener('resize', resizeHandler);
-            eventListeners.push({ element: window, type: 'resize', handler: resizeHandler });
+            });
         }
 
         /**
          * Cleanup function to remove event listeners and observers
          */
         function cleanup() {
-            // Remove all event listeners
-            eventListeners.forEach(({ element, type, handler }) => {
-                element.removeEventListener(type, handler);
+            eventListeners.forEach(({ element, type, handler, capture }) => {
+                element.removeEventListener(type, handler, capture);
             });
+            eventListeners.length = 0;
 
-            // Disconnect observer
             if (autoplayObserver) {
                 autoplayObserver.disconnect();
             }
 
-            // Clear timers
             stopAutoplay();
             clearTimeout(resizeTimer);
+            delete component.__tabsCleanup;
         }
 
         /**
          * Initialize the component
          */
         function init() {
-            // Setup mobile dropdown if needed
+            setupTabSemantics();
             setupMobileDropdown();
+            guardPaneVideos();
 
-            // Setup autoplay if needed
-            setupAutoplayProgressBars();
-            setupAutoplayObserver();
-            setupAutoplayHoverPause();
-            setupAutoplayToggle();
+            // Reduced motion: start paused, the play/pause toggle can still start it
+            if (autoplayEnabled && prefersReducedMotion) {
+                pauseReasons.add('user');
+            }
 
-            // Find and set initial active tab
             const initialIndex = findInitialActiveIndex();
             setActiveTab(initialIndex);
 
-            // Setup interactions
+            setupAutoplayProgressBars();
+            setupAutoplayObserver();
+            setupAutoplayHoverPause();
+            setupAutoplayFocusPause();
+            setupAutoplayVisibilityPause();
+            setupAutoplayToggle();
             setupClickHandlers();
             setupKeyboardNav();
             setupResizeHandler();
 
-            // Start autoplay if enabled
             if (autoplayEnabled) {
+                updatePausedState();
                 startAutoplay();
             }
 
-            // Handle hash changes for deep linking
-            const hashChangeHandler = function() {
+            on(window, 'hashchange', () => {
                 if (window.location.hash) {
                     const hash = window.location.hash.substring(1);
-                    const matchIndex = tabLinksArray.findIndex(link => link.id === hash);
+                    const matchIndex = tabLinksArray.findIndex((link) => link.id === hash);
                     if (matchIndex !== -1) {
                         setActiveTab(matchIndex);
                     }
                 }
-            };
-
-            window.addEventListener('hashchange', hashChangeHandler);
-            eventListeners.push({ element: window, type: 'hashchange', handler: hashChangeHandler });
+            });
         }
 
-        // Initialize this component
         init();
-
-        // Store cleanup function on component for potential later use
         component.__tabsCleanup = cleanup;
+    }
+
+    /**
+     * Parse a duration attribute ("12", "26s"). Returns 0 for empty or invalid values.
+     */
+    function parseDuration(value) {
+        const parsed = parseFloat(value);
+        return !isNaN(parsed) && parsed > 0 ? parsed : 0;
     }
 
     /**
@@ -557,7 +754,6 @@
     function initAllTabs() {
         // Re-query for tabs components in case they were added dynamically
         const components = document.querySelectorAll('[data-tabs-component]');
-
         if (!components.length) {
             return;
         }
