@@ -506,7 +506,6 @@
          * Initialize the component
          */
         function init() {
-            console.log("hello world");
             // Setup mobile dropdown if needed
             setupMobileDropdown();
 
