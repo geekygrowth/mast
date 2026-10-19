@@ -14,6 +14,7 @@
  *   pane) and while the browser tab is in the background, and starts paused when the
  *   visitor prefers reduced motion. Pressing play overrides hover and focus pauses.
  * - Tabs components nested inside a pane are independent of their parent.
+ * - Tabs hidden with display: none are skipped by the arrow keys, Home/End and autoplay.
  * - Safe to run twice: a component that was already initialized is cleaned up first.
  *
  * Versions: v1.x = original Mast tabs (legacy cover-button markup). v2.x = this script.
@@ -398,8 +399,7 @@
             autoplayStartTime = Date.now();
 
             autoplayTimer = setTimeout(() => {
-                const nextIndex = (currentActiveIndex + 1) % tabLinksArray.length;
-                setActiveTab(nextIndex);
+                setActiveTab(findAvailableIndex(currentActiveIndex, 1));
             }, remainingTime);
         }
 
@@ -587,6 +587,28 @@
         }
 
         /**
+         * A tab hidden with display: none (e.g. a page script hiding tabs whose CMS list is
+         * empty) is skipped by the arrow keys, Home/End and autoplay. Only the tab's own
+         * display counts, because a closed mobile dropdown hides every tab via its parent.
+         */
+        function isTabAvailable(link) {
+            return !link.hidden && getComputedStyle(link).display !== 'none';
+        }
+
+        /**
+         * Next available tab from `from` in direction `step` (1 or -1), wrapping around.
+         * Returns the current index if no other tab is available.
+         */
+        function findAvailableIndex(from, step) {
+            const length = tabLinksArray.length;
+            for (let n = 1; n <= length; n++) {
+                const i = (((from + step * n) % length) + length) % length;
+                if (isTabAvailable(tabLinksArray[i])) return i;
+            }
+            return currentActiveIndex;
+        }
+
+        /**
          * Find initial active tab index
          */
         function findInitialActiveIndex() {
@@ -610,7 +632,6 @@
          * Setup keyboard navigation (Left/Right, or Up/Down for vertical menus; Home, End, Enter, Space)
          */
         function setupKeyboardNav() {
-            const tabLinksLength = tabLinksArray.length;
             const prevKey = isVertical ? 'ArrowUp' : 'ArrowLeft';
             const nextKey = isVertical ? 'ArrowDown' : 'ArrowRight';
 
@@ -624,16 +645,16 @@
                             newIndex = index;
                             break;
                         case prevKey:
-                            newIndex = currentActiveIndex > 0 ? currentActiveIndex - 1 : tabLinksLength - 1;
+                            newIndex = findAvailableIndex(currentActiveIndex, -1);
                             break;
                         case nextKey:
-                            newIndex = currentActiveIndex < tabLinksLength - 1 ? currentActiveIndex + 1 : 0;
+                            newIndex = findAvailableIndex(currentActiveIndex, 1);
                             break;
                         case 'Home':
-                            newIndex = 0;
+                            newIndex = findAvailableIndex(-1, 1);
                             break;
                         case 'End':
-                            newIndex = tabLinksLength - 1;
+                            newIndex = findAvailableIndex(tabLinksArray.length, -1);
                             break;
                         default:
                             return;
