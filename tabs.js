@@ -421,12 +421,12 @@
             const progressBar = tabLinksArray[currentActiveIndex].querySelector('[data-tabs-autoplay-progress]');
             if (!progressBar) return;
 
+            // Reading offsetWidth forces a reflow, so the animation restarts synchronously.
+            // (A requestAnimationFrame-based reset can stall where frames are throttled,
+            // leaving the bar stuck at animation: none.)
             progressBar.style.animation = 'none';
-            requestAnimationFrame(() => {
-                requestAnimationFrame(() => {
-                    progressBar.style.animation = '';
-                });
-            });
+            void progressBar.offsetWidth;
+            progressBar.style.animation = '';
         }
 
         /**
