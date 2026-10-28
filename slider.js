@@ -172,6 +172,15 @@
       config.grabCursor = true;
     }
 
+    // Configure mousewheel / trackpad control (default: true, can be disabled with data-mousewheel="false")
+    // forceToAxis keeps it to the slider's own axis, so vertical page scrolling is never captured
+    if (element.dataset.mousewheel !== "false") {
+      config.mousewheel = {
+        enabled: true,
+        forceToAxis: true,
+      };
+    }
+
     // Find the parent component wrapper
     const componentWrapper = element.closest('[data-slider="component"]');
 
